@@ -1,6 +1,6 @@
 # 📦 **AWSCTX** — AWS Profile Switcher & Manager
 
-> **AWSCTX** is a beautiful, interactive Bash utility for managing multiple AWS profiles. Effortlessly add, remove, rename, copy, and switch between profiles with fuzzy search, color output, and tab completion. 
+**AWSCTX** is a beautiful, interactive Bash utility for managing multiple AWS profiles. Effortlessly add, remove, rename, copy, and switch between profiles with fuzzy search, color output, and tab completion. 
 
 ---
 
