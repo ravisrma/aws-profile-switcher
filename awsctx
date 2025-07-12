@@ -1,0 +1,352 @@
+#!/bin/bash
+
+AWS_CREDENTIALS_FILE=~/.aws/credentials
+AWS_CONFIG_FILE=~/.aws/config
+AWS_BACKUP_DIR=~/.awsctx_backup
+
+# Color codes
+RED='\e[31m'
+GREEN='\e[32m'
+YELLOW='\e[33m'
+NC='\e[0m' # No Color
+
+# Dependency check
+function check_dependencies() {
+    local missing=0
+    for dep in fzf awk grep sed; do
+        if ! command -v $dep &>/dev/null; then
+            echo -e "${RED}Missing dependency: $dep${NC}"
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        echo -e "${YELLOW}Please install the missing dependencies before using awsctx.${NC}"
+        exit 1
+    fi
+}
+
+# Backup credentials/config before changes
+function backup_aws_files() {
+    mkdir -p "$AWS_BACKUP_DIR"
+    cp "$AWS_CREDENTIALS_FILE" "$AWS_BACKUP_DIR/credentials.$(date +%s)" 2>/dev/null
+    cp "$AWS_CONFIG_FILE" "$AWS_BACKUP_DIR/config.$(date +%s)" 2>/dev/null
+}
+
+function show_help() {
+    echo ""
+    echo -e "${GREEN}📦 AWSCTX - Simple AWS Profile Manager${NC}"
+    echo ""
+    echo "Usage:"
+    echo "  awsctx [command]            Description"
+    echo ""
+    echo "  awsctx                      Interactively switch the default AWS profile"
+    echo "  awsctx add                  Add a new AWS profile"
+    echo "  awsctx ls                   List all available AWS profiles"
+    echo "  awsctx rm <profile_name>    Remove a specific AWS profile by name"
+    echo "  awsctx rename <old> <new>   Rename a profile"
+    echo "  awsctx copy <src> <dest>    Copy a profile"
+    echo "  awsctx show <profile>       Show profile details"
+    echo "  awsctx --help, -h           Show this help message"
+    echo ""
+}
+
+
+function list_profiles() {
+    if [[ ! -f "$AWS_CREDENTIALS_FILE" ]]; then
+        echo -e "${RED}No credentials file found.${NC}"
+        return
+    fi
+
+    echo "Available AWS profiles:"
+    profiles=$(grep '^\[' "$AWS_CREDENTIALS_FILE" | sed 's/^\[\(.*\)\]$/\1/')
+    for p in $profiles; do
+        if [[ "$p" == "default" ]]; then
+            echo -e "- ${GREEN}$p (current)${NC}"
+        else
+            echo "- $p"
+        fi
+    done
+}
+
+
+function add_profile() {
+    read -p "Enter profile name: " profile
+    read -p "AWS Access Key ID: " access_key
+    read -s -p "AWS Secret Access Key: " secret_key
+    echo ""
+    read -p "Default region (e.g. ap-southeast-1): " region
+    read -p "MFA Serial (optional): " mfa_serial
+    read -p "Source Profile (for MFA, optional): " source_profile
+
+    # Validate AWS keys
+    if ! [[ $access_key =~ ^AKIA[0-9A-Z]{16}$ ]]; then
+        echo -e "${RED}Invalid AWS Access Key ID format.${NC}"
+        return
+    fi
+    if ! [[ $secret_key =~ ^[0-9a-zA-Z/+]{40}$ ]]; then
+        echo -e "${RED}Invalid AWS Secret Access Key format.${NC}"
+        return
+    fi
+
+    mkdir -p ~/.aws
+    backup_aws_files
+
+    # Check if the given profile already exists
+    if grep -q "^\[$profile\]" "$AWS_CREDENTIALS_FILE" 2>/dev/null || \
+       grep -q "^\[profile $profile\]" "$AWS_CONFIG_FILE" 2>/dev/null; then
+        echo -e "${RED}❌ Profile '$profile' already exists.${NC}"
+        return
+    fi
+
+    # Add aws_access_key_id aws_secret_access_key to credentials file
+    {
+        echo "[$profile]"
+        echo "aws_access_key_id = $access_key"
+        echo "aws_secret_access_key = $secret_key"
+        echo ""
+    } >> "$AWS_CREDENTIALS_FILE"
+
+    # Add region and MFA to config file
+    {
+        echo "[profile $profile]"
+        if [ -n "$region" ]; then
+            echo "region = $region"
+        fi
+        if [ -n "$mfa_serial" ]; then
+            echo "mfa_serial = $mfa_serial"
+        fi
+        if [ -n "$source_profile" ]; then
+            echo "source_profile = $source_profile"
+        fi
+        echo ""
+    } >> "$AWS_CONFIG_FILE"
+
+    echo -e "${GREEN}✅ Profile '$profile' added successfully.${NC}"
+    echo -e "${YELLOW}You can now switch to this profile using: awsctx${NC}"
+}
+
+function remove_profile() {
+    if [[ ! -f "$AWS_CREDENTIALS_FILE" ]]; then
+        echo -e "${RED}No credentials file found.${NC}"
+        return
+    fi
+
+    profiles=$(grep '^\[' "$AWS_CREDENTIALS_FILE" | sed 's/^\[\(.*\)\]$/\1/')
+    selected=$(echo "$profiles" | fzf --prompt="Select profile to remove: ")
+
+    if [[ -z "$selected" ]]; then
+        echo -e "${RED}❌ No profile selected.${NC}"
+        return
+    fi
+
+    # Confirm deletion
+    echo -ne "${YELLOW}⚠️ Are you sure you want to delete the profile '$selected'? [y/N]: ${NC}"
+    read confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        return
+    fi
+
+    backup_aws_files
+
+    # Remove from credentials
+    awk -v profile="[$selected]" '
+        BEGIN {in_section=0}
+        $0 == profile {in_section=1; next}
+        /^\[.*\]/ {if (in_section) {in_section=0}; if (!in_section) print $0; next}
+        { if (!in_section) print }
+    ' "$AWS_CREDENTIALS_FILE" > "${AWS_CREDENTIALS_FILE}.tmp" && mv "${AWS_CREDENTIALS_FILE}.tmp" "$AWS_CREDENTIALS_FILE"
+
+    # Remove from config (note: config uses [profile name])
+    awk -v profile="[profile $selected]" '
+        BEGIN {in_section=0}
+        $0 == profile {in_section=1; next}
+        /^\[.*\]/ {if (in_section) {in_section=0}; if (!in_section) print $0; next}
+        { if (!in_section) print }
+    ' "$AWS_CONFIG_FILE" > "${AWS_CONFIG_FILE}.tmp" && mv "${AWS_CONFIG_FILE}.tmp" "$AWS_CONFIG_FILE"
+
+    echo -e "${GREEN}✅ Profile '$selected' removed.${NC}"
+}
+function rename_profile() {
+    local old_name="$2"
+    local new_name="$3"
+    if [[ -z "$old_name" || -z "$new_name" ]]; then
+        echo -e "${YELLOW}Usage: awsctx rename <old> <new>${NC}"
+        return
+    fi
+    backup_aws_files
+    # Credentials
+    awk -v old="[$old_name]" -v new="[$new_name]" '{if ($0==old) print new; else print $0}' "$AWS_CREDENTIALS_FILE" > "${AWS_CREDENTIALS_FILE}.tmp" && mv "${AWS_CREDENTIALS_FILE}.tmp" "$AWS_CREDENTIALS_FILE"
+    # Config
+    awk -v old="[profile $old_name]" -v new="[profile $new_name]" '{if ($0==old) print new; else print $0}' "$AWS_CONFIG_FILE" > "${AWS_CONFIG_FILE}.tmp" && mv "${AWS_CONFIG_FILE}.tmp" "$AWS_CONFIG_FILE"
+    echo -e "${GREEN}Profile '$old_name' renamed to '$new_name'.${NC}"
+}
+
+function copy_profile() {
+    local src="$2"
+    local dest="$3"
+    if [[ -z "$src" || -z "$dest" ]]; then
+        echo -e "${YELLOW}Usage: awsctx copy <src> <dest>${NC}"
+        return
+    fi
+    backup_aws_files
+    # Credentials
+    awk -v src="[$src]" -v dest="[$dest]" '
+        BEGIN{copy=0}
+        $0==src{copy=1; print "["dest"]"; next}
+        /^\[.*\]/{copy=0}
+        copy{print}
+    ' "$AWS_CREDENTIALS_FILE" >> "$AWS_CREDENTIALS_FILE"
+    # Config
+    awk -v src="[profile $src]" -v dest="[profile $dest]" '
+        BEGIN{copy=0}
+        $0==src{copy=1; print dest; next}
+        /^\[.*\]/{copy=0}
+        copy{print}
+    ' "$AWS_CONFIG_FILE" >> "$AWS_CONFIG_FILE"
+    echo -e "${GREEN}Profile '$src' copied to '$dest'.${NC}"
+}
+
+function show_profile() {
+    local profile="$2"
+    if [[ -z "$profile" ]]; then
+        echo -e "${YELLOW}Usage: awsctx show <profile>${NC}"
+        return
+    fi
+    echo -e "${YELLOW}Credentials:${NC}"
+    awk -v profile="[$profile]" 'BEGIN{show=0} $0==profile{show=1; next} /^\[.*\]/{if(show)exit; show=0} show{print}' "$AWS_CREDENTIALS_FILE"
+    echo -e "${YELLOW}Config:${NC}"
+    awk -v profile="[profile $profile]" 'BEGIN{show=0} $0==profile{show=1; next} /^\[.*\]/{if(show)exit; show=0} show{print}' "$AWS_CONFIG_FILE"
+}
+
+
+
+function switch_profile() {
+    check_dependencies
+
+    # List profiles excluding [default]
+    profiles=$(grep '^\[' "$AWS_CREDENTIALS_FILE" | grep -v '\[default\]' | sed 's/^\[\(.*\)\]$/\1/')
+
+    selected=$(echo "$profiles" | fzf --prompt="Select AWS profile to use: ")
+
+    # Check if nothing is selected
+    if [ -z "$selected" ]; then
+        echo -e "${RED}❌ No profile selected.${NC}"
+        exit 1
+    fi
+
+    # Extract the credentials
+    access_key=$(awk -v profile="[$selected]" '
+        $0 == profile {found=1; next}
+        /^\[/ {found=0}
+        found && $1 == "aws_access_key_id" {print $3}
+    ' "$AWS_CREDENTIALS_FILE")
+
+    secret_key=$(awk -v profile="[$selected]" '
+        $0 == profile {found=1; next}
+        /^\[/ {found=0}
+        found && $1 == "aws_secret_access_key" {print $3}
+    ' "$AWS_CREDENTIALS_FILE")
+
+    region=$(awk -v profile="[profile $selected]" '
+        $0 == profile {found=1; next}
+        /^\[profile/ {found=0}
+        found && $1 == "region" {print $3}
+    ' "$AWS_CONFIG_FILE")
+
+    # Check if both access_key and secret_key are found 
+    # no need to check region as it is optional
+    if [[ -z $access_key || -z $secret_key ]]; then
+        echo -e "${RED}❌ Could not extract complete data for profile '$selected'.${NC}"
+        exit 1
+    fi
+
+# Remove existing [default] section from credential file then add the new one
+    # Remove existing [default] section from credentials
+    awk '
+        BEGIN {in_section=0}
+        /^\[default\]/ {in_section=1; next}
+        /^\[.*\]/ {if (in_section) in_section=0}
+        { if (!in_section) print }
+    ' "$AWS_CREDENTIALS_FILE" > "${AWS_CREDENTIALS_FILE}.tmp" && mv "${AWS_CREDENTIALS_FILE}.tmp" "$AWS_CREDENTIALS_FILE"
+
+    # Append new default
+    {
+        echo "[default]"
+        echo "aws_access_key_id = $access_key"
+        echo "aws_secret_access_key = $secret_key"
+        echo ""
+    } >> "$AWS_CREDENTIALS_FILE"
+
+# Remove existing [default] section from config file then add the new one
+    # Remove existing [default] section from config
+    awk '
+        BEGIN {in_section=0}
+        /^\[default\]/ {in_section=1; next}
+        /^\[.*\]/ {if (in_section) in_section=0}
+        { if (!in_section) print }
+    ' "$AWS_CONFIG_FILE" > "${AWS_CONFIG_FILE}.tmp" && mv "${AWS_CONFIG_FILE}.tmp" "$AWS_CONFIG_FILE"
+
+    # Append new default
+    {
+        echo "[default]"
+        if [ -n "$region" ]; then
+            echo "region = $region"
+        fi
+        # echo "region = $region"
+        echo ""
+    } >> "$AWS_CONFIG_FILE"
+
+    echo "✅ Now using '$selected' as your default AWS profile."
+    echo -e "${GREEN}✅ Now using '$selected' as your default AWS profile.${NC}"
+}
+
+# Main
+check_dependencies
+case "$1" in
+    add)
+        add_profile "$@"
+        ;;
+    ls|list)
+        list_profiles "$@"
+        ;;
+    rm|remove)
+        remove_profile "$@"
+        ;;
+    rename)
+        rename_profile "$@"
+        ;;
+    copy)
+        copy_profile "$@"
+        ;;
+    show)
+        show_profile "$@"
+        ;;
+    --help|-h)
+        show_help
+        ;;
+    "")
+        switch_profile "$@"
+        ;;
+    *)
+        echo -e "${RED}❌ Unknown command: $1${NC}"
+        show_help
+        ;;
+esac
+
+# Tab completion for commands and profile names
+_awsctx_completions() {
+    local cur prev opts profiles
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="add ls rm rename copy show --help -h"
+    profiles=$(grep '^\[' "$AWS_CREDENTIALS_FILE" 2>/dev/null | sed 's/^\[\(.*\)\]$/\1/')
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    elif [[ $prev =~ ^(rm|rename|copy|show)$ ]]; then
+        COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+    fi
+    return 0
+}
+complete -F _awsctx_completions awsctx
